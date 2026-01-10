@@ -1,14 +1,13 @@
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
 import os
 import tempfile
 import json
+import base64
 from typing import Optional
 
 app = FastAPI(title="Shiftune Audio Processor")
 
-# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -19,7 +18,7 @@ app.add_middleware(
 
 @app.get("/")
 def read_root():
-    return {"service": "Shiftune", "status": "running", "version": "2.1.0"}
+    return {"service": "Shiftune", "status": "running", "version": "2.2.0"}
 
 @app.get("/health")
 def health():
@@ -27,41 +26,33 @@ def health():
 
 @app.get("/ping")
 def ping():
-    """Keep-alive endpoint to prevent cold starts."""
     return {"pong": True}
 
 
 def analyze_audio(file_path: str) -> dict:
-    """Analyze audio file for BPM - OPTIMIZED for speed."""
     try:
         import librosa
         import numpy as np
         
-        # Load only 15 seconds, lower sample rate for speed
         y, sr = librosa.load(file_path, sr=16000, duration=15, mono=True)
         
-        # Fast tempo detection
         tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
         bpm = int(round(float(tempo[0]) if hasattr(tempo, '__iter__') else float(tempo)))
         bpm = max(60, min(200, bpm))
         
-        # Quick spectral analysis
         centroid = float(librosa.feature.spectral_centroid(y=y, sr=sr).mean())
         mood = "Bright" if centroid > 2500 else "Balanced" if centroid > 1500 else "Warm"
         
-        # Quick energy analysis
         rms = float(librosa.feature.rms(y=y).mean())
         energy = "High" if rms > 0.08 else "Medium" if rms > 0.03 else "Low"
         
         return {"bpm": bpm, "mood": mood, "energy": energy}
-        
     except Exception as e:
         print(f"Librosa error: {e}")
         return {"bpm": 120, "mood": "Balanced", "energy": "Medium"}
 
 
 def generate_name(bpm: int, mood: str, energy: str) -> dict:
-    """Generate creative name using OpenAI."""
     api_key = os.getenv("OPENAI_API_KEY")
     
     if not api_key:
@@ -80,7 +71,7 @@ def generate_name(bpm: int, mood: str, energy: str) -> dict:
 BPM: {bpm}, Mood: {mood}, Energy: {energy}
 
 Reply ONLY with JSON: {{"trackName": "Name Here", "trackSlug": "name-here"}}
-trackSlug = lowercase, hyphens, no spaces."""
+trackSlug = lowercase, hyphens only, no spaces."""
             }],
             max_tokens=50,
             temperature=0.9
@@ -92,7 +83,6 @@ trackSlug = lowercase, hyphens, no spaces."""
         
         data = json.loads(text)
         return {"trackName": data["trackName"], "trackSlug": data["trackSlug"]}
-        
     except Exception as e:
         print(f"OpenAI error: {e}")
         slug = f"{mood.lower()}-{energy.lower()}-{bpm}bpm"
@@ -100,7 +90,6 @@ trackSlug = lowercase, hyphens, no spaces."""
 
 
 def write_id3_tags(file_path: str, track_name: str, bpm: int, mood: str, energy: str) -> bytes:
-    """Write ID3 tags to MP3 file and return the modified file bytes."""
     from mutagen.mp3 import MP3
     from mutagen.id3 import ID3, TIT2, TPE1, TALB, TBPM, COMM, ID3NoHeaderError
     
@@ -127,17 +116,14 @@ def write_id3_tags(file_path: str, track_name: str, bpm: int, mood: str, energy:
         
         with open(file_path, 'rb') as f:
             return f.read()
-            
     except Exception as e:
-        print(f"ID3 tag error: {e}")
+        print(f"ID3 error: {e}")
         with open(file_path, 'rb') as f:
             return f.read()
 
 
 def write_flac_tags(file_path: str, track_name: str, bpm: int, mood: str, energy: str) -> bytes:
-    """Write tags to FLAC file."""
     from mutagen.flac import FLAC
-    
     try:
         audio = FLAC(file_path)
         audio["title"] = track_name
@@ -146,11 +132,10 @@ def write_flac_tags(file_path: str, track_name: str, bpm: int, mood: str, energy
         audio["bpm"] = str(bpm)
         audio["comment"] = f"{mood}, {energy} energy"
         audio.save()
-        
         with open(file_path, 'rb') as f:
             return f.read()
     except Exception as e:
-        print(f"FLAC tag error: {e}")
+        print(f"FLAC error: {e}")
         with open(file_path, 'rb') as f:
             return f.read()
 
@@ -161,8 +146,7 @@ async def process_audio(
     skip_duplicate_check: Optional[str] = Form("false"),
     payment_intent_id: Optional[str] = Form(None)
 ):
-    """Process audio: detect BPM, generate name, write ID3 tags, return file."""
-    
+    """Process audio: detect BPM, generate name, write ID3 tags, return JSON with base64 file."""
     tmp_path = None
     
     try:
@@ -183,32 +167,31 @@ async def process_audio(
         track_slug = name_data["trackSlug"]
         print(f"Generated: {track_name}")
         
+        # Write tags
         if ext == '.mp3':
             file_bytes = write_id3_tags(tmp_path, track_name, audio_data['bpm'], audio_data['mood'], audio_data['energy'])
-            media_type = "audio/mpeg"
         elif ext == '.flac':
             file_bytes = write_flac_tags(tmp_path, track_name, audio_data['bpm'], audio_data['mood'], audio_data['energy'])
-            media_type = "audio/flac"
         else:
             with open(tmp_path, 'rb') as f:
                 file_bytes = f.read()
-            media_type = "application/octet-stream"
         
+        # Base64 encode for JSON
+        file_base64 = base64.b64encode(file_bytes).decode('utf-8')
         new_filename = f"{track_slug}{ext}"
         
-        return Response(
-            content=file_bytes,
-            media_type=media_type,
-            headers={
-                "Content-Disposition": f'attachment; filename="{new_filename}"',
-                "X-Track-Name": track_name,
-                "X-Track-Slug": track_slug,
-                "X-BPM": str(audio_data['bpm']),
-                "X-Mood": audio_data['mood'],
-                "X-Energy": audio_data['energy'],
-                "Access-Control-Expose-Headers": "X-Track-Name, X-Track-Slug, X-BPM, X-Mood, X-Energy, Content-Disposition"
-            }
-        )
+        return {
+            "status": "success",
+            "track_name": track_name,
+            "track_slug": track_slug,
+            "bpm": audio_data["bpm"],
+            "mood": audio_data["mood"],
+            "energy": audio_data["energy"],
+            "original_filename": file.filename,
+            "new_filename": new_filename,
+            "file_data": file_base64,
+            "file_type": "audio/mpeg" if ext == ".mp3" else "audio/flac" if ext == ".flac" else "audio/wav"
+        }
         
     except Exception as e:
         print(f"ERROR: {e}")
