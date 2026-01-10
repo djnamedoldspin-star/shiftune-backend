@@ -3,27 +3,25 @@ from fastapi.middleware.cors import CORSMiddleware
 import os
 import random
 import re
+import tempfile
+
+import librosa  # BPM detection
 
 app = FastAPI(title="Shiftune API")
 
-# ------------------------------------------------------
-# CORS – allow the frontend and local testing to call us
-# ------------------------------------------------------
+# CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],          # allow any origin (frontend, localhost, etc.)
+    allow_origins=["*"],
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# -------------------------
-# Helper data
-# -------------------------
 ADJECTIVES = [
     "Midnight", "Neon", "Velvet", "Electric", "Golden",
     "Shadow", "Crystal", "Liquid", "Silent", "Ghost",
-    "Solar", "Urban", "Velvet", "Static", "Emerald",
+    "Solar", "Urban", "Static", "Emerald",
 ]
 
 NOUNS = [
@@ -39,26 +37,32 @@ MOODS = [
 
 
 def slugify(text: str) -> str:
-    """Turn a title into a URL/filename-friendly slug."""
     text = text.lower()
     text = re.sub(r"[^a-z0-9\s-]", "", text)
     text = re.sub(r"\s+", "-", text).strip("-")
     return text[:60]
 
 
-def generate_title_from_filename(filename: str) -> str:
-    """
-    OLD: tried to tidy the original filename.
-    NEW: always invent a fresh, store-ready title.
-    """
-    adjective = random.choice(ADJECTIVES)
-    noun = random.choice(NOUNS)
-    return f"{adjective} {noun}"
+def generate_title() -> str:
+    return f"{random.choice(ADJECTIVES)} {random.choice(NOUNS)}"
 
 
-# -------------------------
-# Routes
-# -------------------------
+def detect_bpm(tmp_path: str) -> float:
+    """
+    Try to detect BPM using librosa.
+    If anything fails, fall back to a random reasonable BPM.
+    """
+    try:
+        y, sr = librosa.load(tmp_path, sr=None, mono=True)
+        tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
+        bpm = float(tempo)
+        if bpm <= 0:
+            raise ValueError("invalid tempo")
+        return round(bpm)
+    except Exception:
+        return random.randint(80, 140)
+
+
 @app.get("/")
 def root():
     return {
@@ -78,20 +82,27 @@ async def process_audio(file: UploadFile = File(...)):
     Receive one audio file and return:
     - clean, made-up track name
     - slug for filename (includes BPM)
-    - fake BPM + mood (for display)
+    - detected BPM (or reasonable fallback)
+    - mood tag
     """
     original_name = file.filename or "untitled.wav"
 
-    # 1) generate new title (ignores messy original)
-    track_name = generate_title_from_filename(original_name)
+    # Save upload to a temp file for librosa
+    contents = await file.read()
+    with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(original_name)[1]) as tmp:
+        tmp.write(contents)
+        tmp_path = tmp.name
 
-    # 2) random but reasonable BPM
-    bpm = random.randint(80, 140)
+    try:
+        bpm = detect_bpm(tmp_path)
+    finally:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
 
-    # 3) random mood tag
+    track_name = generate_title()
     mood = random.choice(MOODS)
-
-    # 4) slug for filename, includes BPM so rename is obvious
     base_slug = slugify(track_name)
     track_slug = f"{base_slug}-{bpm}"
 
@@ -104,7 +115,6 @@ async def process_audio(file: UploadFile = File(...)):
     }
 
 
-# for local testing (not used by Render directly)
 if __name__ == "__main__":
     import uvicorn
 
