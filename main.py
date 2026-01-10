@@ -17,27 +17,29 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
 # -------------------------
-# Helper functions
+# Helper data
 # -------------------------
 ADJECTIVES = [
     "Midnight", "Neon", "Velvet", "Electric", "Golden",
-    "Shadow", "Crystal", "Liquid", "Silent", "Ghost"
+    "Shadow", "Crystal", "Liquid", "Silent", "Ghost",
+    "Solar", "Urban", "Velvet", "Static", "Emerald",
 ]
 
 NOUNS = [
     "Transit", "Echoes", "Parade", "Circuit", "Skyline",
-    "Mirage", "Boulevard", "Memory", "Pulse", "Pattern"
+    "Mirage", "Boulevard", "Memory", "Pulse", "Pattern",
+    "Harbor", "Avenue", "Spectrum", "Signal", "Garden",
 ]
 
 MOODS = [
     "chill", "dark", "uplifting", "moody", "energetic",
-    "dreamy", "aggressive", "romantic", "mysterious", "playful"
+    "dreamy", "aggressive", "romantic", "mysterious", "playful",
 ]
 
 
 def slugify(text: str) -> str:
+    """Turn a title into a URL/filename-friendly slug."""
     text = text.lower()
     text = re.sub(r"[^a-z0-9\s-]", "", text)
     text = re.sub(r"\s+", "-", text).strip("-")
@@ -45,19 +47,13 @@ def slugify(text: str) -> str:
 
 
 def generate_title_from_filename(filename: str) -> str:
-    name, _ = os.path.splitext(filename)
-    # clean common junk
-    name = name.replace("_", " ").replace("-", " ")
-    name = re.sub(r"(mix|master|final|v\d+|\d{3}bpm)", "", name, flags=re.I)
-    name = re.sub(r"\s+", " ", name).strip()
-
-    # if something readable is left, title-case it
-    if len(name) > 3:
-        base = name.title()
-    else:
-        base = f"{random.choice(ADJECTIVES)} {random.choice(NOUNS)}"
-
-    return base
+    """
+    OLD: tried to tidy the original filename.
+    NEW: always invent a fresh, store-ready title.
+    """
+    adjective = random.choice(ADJECTIVES)
+    noun = random.choice(NOUNS)
+    return f"{adjective} {noun}"
 
 
 # -------------------------
@@ -80,23 +76,24 @@ def health():
 async def process_audio(file: UploadFile = File(...)):
     """
     Receive one audio file and return:
-    - nice track name
-    - slug for filename
+    - clean, made-up track name
+    - slug for filename (includes BPM)
     - fake BPM + mood (for display)
     """
     original_name = file.filename or "untitled.wav"
 
-    # generate title
+    # 1) generate new title (ignores messy original)
     track_name = generate_title_from_filename(original_name)
 
-    # random but reasonable BPM
+    # 2) random but reasonable BPM
     bpm = random.randint(80, 140)
 
-    # random mood tag
+    # 3) random mood tag
     mood = random.choice(MOODS)
 
-    # slug for filename
-    track_slug = slugify(track_name)
+    # 4) slug for filename, includes BPM so rename is obvious
+    base_slug = slugify(track_name)
+    track_slug = f"{base_slug}-{bpm}"
 
     return {
         "status": "success",
