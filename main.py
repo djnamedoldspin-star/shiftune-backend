@@ -17,7 +17,7 @@ import secrets
 import time
 
 from pydantic import BaseModel
-APP_VERSION = "2.2.2-texturebpm"
+APP_VERSION = "2.3.0-texturebpm"
 APP_NAME = "Shiftune Audio Processor"
 # ===========================
 # STRIPE (Checkout MVP - no webhook)
@@ -111,9 +111,11 @@ OPENAI_TIMEOUT_SEC = int(os.getenv("OPENAI_TIMEOUT_SEC", "20"))
 
 app = FastAPI(title=APP_NAME, version=APP_VERSION)
 
+# Use configured origins in production, fallback to wildcard only if explicitly empty
+_cors_origins = ALLOWED_ORIGINS if ALLOWED_ORIGINS else ["*"]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # DEV: allow all origins so frontend can reach backend
+    allow_origins=_cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -612,6 +614,159 @@ async def process_audio(
                 os.remove(tmp_path)
         except Exception:
             pass
+
+
+from typing import List
+
+@app.post("/process-all")
+async def process_all(
+    request: Request,
+    files: List[UploadFile] = File(...),
+    access_token: str | None = Form(None),
+):
+    """
+    Batch endpoint: process multiple audio files in one request.
+    Returns an array of results, one per file.
+    """
+    ip = _client_ip(request)
+    _rate_limit_or_429(ip)
+
+    if not files:
+        raise HTTPException(status_code=400, detail="No files provided.")
+
+    files_count = len(files)
+    results = []
+
+    # If payment is required, validate token has enough credits
+    if SHIFTUNE_REQUIRE_PAYMENT and stripe.api_key:
+        token_data = PAID_TOKENS.get(access_token or "")
+        if not token_data:
+            checkout_url = None
+            try:
+                session = _create_checkout_session(files_count=files_count, job_id="")
+                checkout_url = session.url if session else None
+            except Exception:
+                pass
+            return {
+                "status": "payment_required",
+                "detail": "Payment required to process files.",
+                "checkout_url": checkout_url,
+                "price_cents": _calc_amount_cents(files_count),
+                "files_count": files_count,
+            }
+        
+        if time.time() > float(token_data.get("expires", 0)):
+            PAID_TOKENS.pop(access_token, None)
+            return {
+                "status": "payment_required",
+                "detail": "Access token expired.",
+                "files_count": files_count,
+            }
+        
+        remaining = int(token_data.get("remaining", 0))
+        if remaining < files_count:
+            return {
+                "status": "payment_required",
+                "detail": f"Token only has {remaining} credits, but {files_count} files submitted.",
+                "files_count": files_count,
+            }
+
+    for file in files:
+        tmp_path = None
+        try:
+            if not file.filename:
+                results.append({
+                    "status": "error",
+                    "error": "Missing filename",
+                    "original_filename": None,
+                })
+                continue
+
+            ext = os.path.splitext(file.filename)[1].lower().strip()
+            if not ext:
+                ext = ".mp3"
+
+            data = await file.read()
+            if not data:
+                results.append({
+                    "status": "error",
+                    "error": "Empty file",
+                    "original_filename": file.filename,
+                })
+                continue
+
+            if len(data) > MAX_FILE_BYTES:
+                results.append({
+                    "status": "error",
+                    "error": f"File too large. Max {MAX_FILE_MB} MB.",
+                    "original_filename": file.filename,
+                })
+                continue
+
+            with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
+                tmp.write(data)
+                tmp_path = tmp.name
+
+            audio_data = analyze_audio(tmp_path)
+            mat_title = make_texture_bpm_title(audio_data["bpm"], data)
+            name_data = generate_name(audio_data["bpm"], audio_data["mood"], audio_data["energy"], data)
+
+            track_name = name_data["trackName"]
+            track_slug = name_data["trackSlug"]
+            new_filename = f"{track_slug}{ext}"
+
+            # Tagging
+            if ext == ".mp3":
+                out_bytes = write_id3_tags(tmp_path, track_name, audio_data["bpm"], audio_data["mood"], audio_data["energy"])
+            elif ext == ".flac":
+                out_bytes = write_flac_tags(tmp_path, track_name, audio_data["bpm"], audio_data["mood"], audio_data["energy"])
+            else:
+                with open(tmp_path, "rb") as f:
+                    out_bytes = f.read()
+
+            # Consume one credit if payment is enforced
+            if SHIFTUNE_REQUIRE_PAYMENT and stripe.api_key and access_token:
+                _consume_access_token(access_token)
+
+            file_base64 = base64.b64encode(out_bytes).decode("utf-8")
+            file_type = mimetypes.types_map.get(ext, None) or file.content_type or "application/octet-stream"
+
+            results.append({
+                "status": "success",
+                "track_name": track_name,
+                "track_slug": track_slug,
+                "bpm": audio_data["bpm"],
+                "mood": audio_data["mood"],
+                "energy": audio_data["energy"],
+                "mat_title": mat_title,
+                "original_filename": file.filename,
+                "new_filename": new_filename,
+                "file_data": file_base64,
+                "file_type": file_type,
+            })
+
+        except Exception as e:
+            logger.exception("Error processing file in /process-all: %s", getattr(file, "filename", None))
+            results.append({
+                "status": "error",
+                "error": str(e),
+                "original_filename": getattr(file, "filename", None),
+            })
+        finally:
+            try:
+                if tmp_path and os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except Exception:
+                pass
+
+    return {
+        "status": "success",
+        "results": results,
+        "total": len(results),
+        "successful": sum(1 for r in results if r.get("status") == "success"),
+        "failed": sum(1 for r in results if r.get("status") == "error"),
+        "version": APP_VERSION,
+    }
 
 
 if __name__ == "__main__":
