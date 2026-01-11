@@ -156,6 +156,31 @@ def extract_first_json_object(s: str) -> Optional[Dict[str, Any]]:
 
 
 # ---------------------------
+# MAT title (Texture Noun + BPM)
+# ---------------------------
+TEXTURE_NOUNS = [
+    "Chrome Drip", "Glass Pulse", "Velour Step", "Carbon Swing",
+    "Silk Current", "Signal Bloom", "Copper Rush", "Golden Haze",
+    "Lunar Drift", "Granite Groove", "Static Bloom", "Midnight Circuit",
+    "Cobalt Slide", "Pearl Tremor", "Ember Sway", "Saffron Glide",
+    "Rivet Waltz", "Ivory Current", "Rust Velocity", "Onyx Drift",
+    "Nimbus Shuffle", "Prism Leak", "Quartz Stutter", "Satin Switch",
+]
+
+
+def make_texture_bpm_title(bpm: int, file_bytes: bytes) -> str:
+    """Stable per-file title: '<Texture Noun> <BPM>BPM'."""
+    if not file_bytes:
+        texture = TEXTURE_NOUNS[0]
+        return f"{texture} {int(round(bpm))}BPM"
+
+    h = hashlib.sha1(file_bytes).hexdigest()
+    seed = int(h[:8], 16)
+    texture = TEXTURE_NOUNS[seed % len(TEXTURE_NOUNS)]
+    return f"{texture} {int(round(bpm))}BPM"
+
+
+# ---------------------------
 # Audio analysis
 # ---------------------------
 def analyze_audio(file_path: str) -> dict:
