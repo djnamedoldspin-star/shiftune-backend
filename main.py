@@ -232,12 +232,14 @@ TEXTURE_NOUNS = [
 ]
 
 
+
 def make_texture_bpm_title(bpm: int, file_bytes: bytes) -> str:
     """
     Randomized texture title: "<Texture Noun> <BPM>BPM-XXXX".
 
-    Uses a mix of file hash (for general vibe) and a short random suffix so that
-    even ten identical files in one batch will still get distinct names.
+    Uses pure randomness for the texture selection so that even identical
+    audio files in the same batch get different names. The file_bytes
+    argument is accepted for compatibility but is not used.
     """
     try:
         base_bpm = int(round(bpm))
@@ -247,22 +249,14 @@ def make_texture_bpm_title(bpm: int, file_bytes: bytes) -> str:
         except Exception:
             base_bpm = 0
 
-    # Choose a texture index partly from the file hash, if bytes are present
-    texture_idx = None
-    if file_bytes:
-        h = hashlib.sha1(file_bytes).hexdigest()
-        texture_idx = int(h[:8], 16) % len(TEXTURE_NOUNS)
-
-    if texture_idx is None:
-        texture_idx = secrets.randbelow(len(TEXTURE_NOUNS))
-
+    # Pick a random texture noun independent of the file contents
+    texture_idx = secrets.randbelow(len(TEXTURE_NOUNS))
     texture = TEXTURE_NOUNS[texture_idx]
 
-    # 4‑character random suffix for uniqueness (per call)
+    # 4-character random suffix for uniqueness (per call)
     suffix = secrets.token_hex(2).upper()  # e.g. "9F3A"
 
     return f"{texture} {base_bpm}BPM-{suffix}"
-
 
 # ---------------------------
 # Audio analysis
