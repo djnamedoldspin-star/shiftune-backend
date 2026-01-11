@@ -216,7 +216,7 @@ def generate_name(bpm: int, mood: str, energy: str) -> dict:
 
     try:
         from openai import OpenAI
-        client = OpenAI(api_key=OPENAI_API_KEY, timeout=OPENAI_TIMEOUT_SEC)
+        client = OpenAI(api_key=OPENAI_API_KEY)
 
         system = (
             "You are Shiftune Studio, a DJ-ready track renaming engine.\n"
