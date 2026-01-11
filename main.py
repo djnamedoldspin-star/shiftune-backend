@@ -14,8 +14,8 @@ import mimetypes
 import stripe
 import uuid
 import time
-from pydantic import BaseModel
 
+from pydantic import BaseModel
 APP_VERSION = "2.2.2-texturebpm"
 APP_NAME = "Shiftune Audio Processor"
 # ===========================
@@ -420,8 +420,6 @@ def root():
     return {
         "name": APP_NAME,
         "version": APP_VERSION,
-            "paid": is_paid,
-            "checkout_url": checkout_url,
         "status": "ok",
         "openai_enabled": bool(OPENAI_API_KEY),
         "model": OPENAI_MODEL,
