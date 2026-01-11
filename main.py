@@ -13,6 +13,7 @@ from typing import Optional, Dict, Any
 import mimetypes
 import stripe
 import uuid
+import secrets
 import time
 
 from pydantic import BaseModel
@@ -233,15 +234,35 @@ TEXTURE_NOUNS = [
 
 
 def make_texture_bpm_title(bpm: int, file_bytes: bytes) -> str:
-    """Stable per-file title: '<Texture Noun> <BPM>BPM'."""
-    if not file_bytes:
-        texture = TEXTURE_NOUNS[0]
-        return f"{texture} {int(round(bpm))}BPM"
+    """
+    Randomized texture title: "<Texture Noun> <BPM>BPM-XXXX".
 
-    h = hashlib.sha1(file_bytes).hexdigest()
-    seed = int(h[:8], 16)
-    texture = TEXTURE_NOUNS[seed % len(TEXTURE_NOUNS)]
-    return f"{texture} {int(round(bpm))}BPM"
+    Uses a mix of file hash (for general vibe) and a short random suffix so that
+    even ten identical files in one batch will still get distinct names.
+    """
+    try:
+        base_bpm = int(round(bpm))
+    except Exception:
+        try:
+            base_bpm = int(bpm)
+        except Exception:
+            base_bpm = 0
+
+    # Choose a texture index partly from the file hash, if bytes are present
+    texture_idx = None
+    if file_bytes:
+        h = hashlib.sha1(file_bytes).hexdigest()
+        texture_idx = int(h[:8], 16) % len(TEXTURE_NOUNS)
+
+    if texture_idx is None:
+        texture_idx = secrets.randbelow(len(TEXTURE_NOUNS))
+
+    texture = TEXTURE_NOUNS[texture_idx]
+
+    # 4‑character random suffix for uniqueness (per call)
+    suffix = secrets.token_hex(2).upper()  # e.g. "9F3A"
+
+    return f"{texture} {base_bpm}BPM-{suffix}"
 
 
 # ---------------------------
