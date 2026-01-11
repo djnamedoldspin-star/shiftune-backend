@@ -113,12 +113,11 @@ app = FastAPI(title=APP_NAME, version=APP_VERSION)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS if ALLOWED_ORIGINS else [],
+    allow_origins=["*"],  # DEV: allow all origins so frontend can reach backend
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 # ---------------------------
 # Security headers
 # ---------------------------
