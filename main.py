@@ -39,7 +39,7 @@ RATE_WINDOW_SEC = int(os.getenv("SHIFTUNE_RATE_WINDOW_SEC", "60"))
 RATE_MAX_REQ = int(os.getenv("SHIFTUNE_RATE_MAX_REQ", "40"))  # per IP per window
 
 # OpenAI
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+OPENAI_API_KEY = os.getenv("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", "").strip()
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o").strip()
 OPENAI_TIMEOUT_SEC = int(os.getenv("OPENAI_TIMEOUT_SEC", "20"))
 
