@@ -14,6 +14,7 @@ import mimetypes
 import stripe
 import uuid
 import time
+from pydantic import BaseModel
 
 APP_VERSION = "2.2.2-texturebpm"
 APP_NAME = "Shiftune Audio Processor"
