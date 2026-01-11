@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, UploadFile, File, Request
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
 import os
 import tempfile
@@ -11,9 +11,72 @@ import hashlib
 from collections import defaultdict, deque
 from typing import Optional, Dict, Any
 import mimetypes
+import stripe
+import uuid
+import time
 
 APP_VERSION = "2.2.2-texturebpm"
 APP_NAME = "Shiftune Audio Processor"
+# ===========================
+# STRIPE (Checkout MVP - no webhook)
+# ===========================
+STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "").strip()
+stripe.api_key = STRIPE_SECRET_KEY if STRIPE_SECRET_KEY else None
+
+FRONTEND_URL = os.getenv("FRONTEND_URL", "").strip() or os.getenv("PUBLIC_URL", "").strip() or "http://localhost:5173"
+SHIFTUNE_UNIT_PRICE_CENTS = int(os.getenv("SHIFTUNE_UNIT_PRICE_CENTS", "20"))   # $0.20 per file
+SHIFTUNE_MINIMUM_CENTS    = int(os.getenv("SHIFTUNE_MINIMUM_CENTS", "300"))     # $3.00 minimum
+SHIFTUNE_REQUIRE_PAYMENT  = os.getenv("SHIFTUNE_REQUIRE_PAYMENT", "0").strip() == "1"
+
+# In-memory, short-lived access tokens created after successful Checkout verification.
+# NOTE: not shared across instances; fine for MVP without webhooks.
+PAID_TOKENS = {}  # token -> {"remaining": int, "expires": float}
+PAID_TOKEN_TTL_SEC = int(os.getenv("SHIFTUNE_TOKEN_TTL_SEC", "3600"))  # 1 hour
+
+def _calc_amount_cents(files_count: int) -> int:
+    files = max(1, int(files_count))
+    return max(files * SHIFTUNE_UNIT_PRICE_CENTS, SHIFTUNE_MINIMUM_CENTS)
+
+def _create_checkout_session(files_count: int, job_id: str = "") -> "stripe.checkout.Session | None":
+    if not stripe.api_key:
+        return None
+    amount = _calc_amount_cents(files_count)
+    session = stripe.checkout.Session.create(
+        mode="payment",
+        line_items=[{
+            "price_data": {
+                "currency": "usd",
+                "product_data": {"name": f"Shiftune Rename ({files_count} files)"},
+                "unit_amount": amount,
+            },
+            "quantity": 1,
+        }],
+        success_url=f"{FRONTEND_URL}/success?session_id={{CHECKOUT_SESSION_ID}}",
+        cancel_url=f"{FRONTEND_URL}/cancel",
+        metadata={"files_count": str(files_count), "job_id": job_id or ""},
+    )
+    return session
+
+def _mint_access_token(files_count: int) -> str:
+    token = uuid.uuid4().hex
+    PAID_TOKENS[token] = {"remaining": int(files_count), "expires": time.time() + PAID_TOKEN_TTL_SEC}
+    return token
+
+def _consume_access_token(token: str) -> bool:
+    if not token:
+        return False
+    data = PAID_TOKENS.get(token)
+    if not data:
+        return False
+    if time.time() > float(data.get("expires", 0)):
+        PAID_TOKENS.pop(token, None)
+        return False
+    remaining = int(data.get("remaining", 0))
+    if remaining <= 0:
+        return False
+    data["remaining"] = remaining - 1
+    return True
+
 
 # ---------------------------
 # Logging
@@ -356,6 +419,8 @@ def root():
     return {
         "name": APP_NAME,
         "version": APP_VERSION,
+            "paid": is_paid,
+            "checkout_url": checkout_url,
         "status": "ok",
         "openai_enabled": bool(OPENAI_API_KEY),
         "model": OPENAI_MODEL,
@@ -372,8 +437,47 @@ def ping():
     return {"pong": True, "version": APP_VERSION}
 
 
+class CheckoutRequest(BaseModel):
+    files_count: int = 1
+    job_id: str | None = None
+
+@app.post("/create-checkout-session")
+def create_checkout_session(body: CheckoutRequest):
+    if not stripe.api_key:
+        raise HTTPException(status_code=500, detail="Stripe not configured (missing STRIPE_SECRET_KEY)")
+    try:
+        session = _create_checkout_session(files_count=body.files_count, job_id=body.job_id or "")
+        return {"url": session.url, "id": session.id}
+    except Exception as e:
+        logger.exception("Stripe create-checkout-session failed")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/verify-checkout-session")
+def verify_checkout_session(session_id: str):
+    if not stripe.api_key:
+        raise HTTPException(status_code=500, detail="Stripe not configured (missing STRIPE_SECRET_KEY)")
+    try:
+        session = stripe.checkout.Session.retrieve(session_id)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Session lookup failed: {e}")
+
+    if session.get("payment_status") != "paid":
+        raise HTTPException(status_code=402, detail="Payment not completed")
+
+    meta = session.get("metadata") or {}
+    files_count = int(meta.get("files_count") or 1)
+    job_id = meta.get("job_id") or ""
+    access_token = _mint_access_token(files_count)
+
+    return {"paid": True, "job_id": job_id, "access_token": access_token, "expires_in_sec": PAID_TOKEN_TTL_SEC}
+
 @app.post("/process-audio")
-async def process_audio(request: Request, file: UploadFile = File(...)):
+async def process_audio(
+    request: Request,
+    file: UploadFile = File(...),
+    access_token: str | None = Form(None),
+    files_count: int = Form(1),  # used for pricing hints only
+):
     ip = _client_ip(request)
     _rate_limit_or_429(ip)
 
@@ -415,6 +519,42 @@ async def process_audio(request: Request, file: UploadFile = File(...)):
             # No tagging support yet; still return bytes (with new filename)
             with open(tmp_path, "rb") as f:
                 out_bytes = f.read()
+        # ===========================
+        # PAYMENT GATE (optional)
+        # ===========================
+        checkout_url = None
+        if stripe.api_key:
+            try:
+                session = _create_checkout_session(files_count=files_count, job_id="")
+                checkout_url = session.url
+            except Exception:
+                checkout_url = None
+
+        is_paid = False
+        if SHIFTUNE_REQUIRE_PAYMENT and stripe.api_key:
+            # consume one credit per processed file
+            is_paid = _consume_access_token(access_token or "")
+            if not is_paid:
+                return {
+                    "status": "payment_required",
+                    "detail": "Payment required to download renamed file.",
+                    "checkout_url": checkout_url,
+                    "price_cents": _calc_amount_cents(files_count),
+                    "bpm": audio_data.get("bpm"),
+                    "mood": audio_data.get("mood"),
+                    "energy": audio_data.get("energy"),
+                    "mat_title": mat_title,
+                    "track_name": track_name,
+                    "track_slug": track_slug,
+                    "original_filename": file.filename,
+                    "new_filename": new_filename,
+                    "version": APP_VERSION,
+            "paid": is_paid,
+            "checkout_url": checkout_url,
+                }
+        else:
+            # not enforcing payment; still return checkout_url as a hint for frontend
+            is_paid = True
 
         file_base64 = base64.b64encode(out_bytes).decode("utf-8")
 
@@ -434,6 +574,8 @@ async def process_audio(request: Request, file: UploadFile = File(...)):
             "file_type": file_type,
             "openai_used": bool(OPENAI_API_KEY),
             "version": APP_VERSION,
+            "paid": is_paid,
+            "checkout_url": checkout_url,
         }
 
     except HTTPException:
