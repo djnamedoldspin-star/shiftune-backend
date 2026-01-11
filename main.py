@@ -7,11 +7,12 @@ import base64
 import logging
 import re
 import time
+import hashlib
 from collections import defaultdict, deque
 from typing import Optional, Dict, Any
 import mimetypes
 
-APP_VERSION = "2.2.2-public"
+APP_VERSION = "2.2.2-texturebpm"
 APP_NAME = "Shiftune Audio Processor"
 
 # ---------------------------
@@ -42,35 +43,6 @@ RATE_MAX_REQ = int(os.getenv("SHIFTUNE_RATE_MAX_REQ", "40"))  # per IP per windo
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o").strip()
 OPENAI_TIMEOUT_SEC = int(os.getenv("OPENAI_TIMEOUT_SEC", "20"))
-# Naming / novelty controls
-SHIFTUNE_NAME_MAX_ATTEMPTS = int(os.getenv("SHIFTUNE_NAME_MAX_ATTEMPTS", "6"))
-SHIFTUNE_RECENT_SLUG_CACHE = int(os.getenv("SHIFTUNE_RECENT_SLUG_CACHE", "200"))
-
-# Recent de-dup (in-memory; per instance)
-RECENT_SLUGS = deque()
-RECENT_SLUGS_SET = set()
-
-SYSTEM_PROMPT = "You generate short, marketable track titles for instrumental beats.\n\nOUTPUT RULES (hard):\n- Return ONLY valid JSON (no markdown, no commentary).\n- Keys exactly: trackName, trackSlug, oneLiner\n- trackName: 2\u20135 words, Title Case, no quotes, no emojis.\n- trackSlug: lowercase kebab-case derived from trackName; ASCII only; 3\u201345 chars.\n- oneLiner: 8\u201316 words, plain English, no hashtags, no quotes.\n\nNOVELTY RULES (hard):\n- You MUST include EXACTLY ONE of the provided VIBE words in trackName (spelled exactly).\n- You MUST include EXACTLY ONE of the provided THEME words in trackName (spelled exactly).\n- You MUST NOT reuse or closely imitate any \u201cavoidSlugs\u201d (treat as blocked).\n- Do NOT use generic filler titles: \u201cExperimental\u201d, \u201cViral\u201d, \u201cUnpredictable\u201d, \u201cHook\u201d, \u201cType Beat\u201d, \u201cBeat\u201d, \u201cInstrumental\u201d, \u201cVolume\u201d, \u201cFinal\u201d, \u201cMixdown\u201d.\n- Do NOT include BPM numbers in trackName.\n\nSTYLE:\n- Sound: modern, DJ-ready, clean, premium, slightly provocative but not explicit.\n- Prefer concrete imagery + motion verbs + sleek nouns.\n- Avoid clich\u00e9 combos (Neon/Velvet/Midnight/Glow/Night) unless forced by VIBE/THEME lists.\n"
-
-def build_user_prompt(bpm: int, mood: str, energy: str, vibe_words: list, theme_words: list, avoid_slugs: list) -> str:
-    vibe_csv = ", ".join(vibe_words) if vibe_words else ""
-    theme_csv = ", ".join(theme_words) if theme_words else ""
-    avoid_csv = ", ".join(avoid_slugs) if avoid_slugs else "none"
-
-    return (
-        "Create a unique track title.\n\n"
-        f"Audio traits:\n- bpm: {bpm}\n- mood: {mood}\n- energy: {energy}\n\n"
-        "Use exactly one VIBE word and exactly one THEME word in the trackName:\n"
-        f"VIBE words: {vibe_csv}\n"
-        f"THEME words: {theme_csv}\n\n"
-        "Avoid these slugs (blocked — do not match, rhyme with, or resemble):\n"
-        f"{avoid_csv}\n\n"
-        "Return JSON only with:\n"
-        "- trackName (2–5 words, Title Case)\n"
-        "- trackSlug (kebab-case)\n"
-        "- oneLiner (8–16 words)\n"
-    ).format(bpm=bpm, mood=mood, energy=energy, vibe_csv=vibe_csv, theme_csv=theme_csv, avoid_csv=avoid_csv)
-
 
 app = FastAPI(title=APP_NAME, version=APP_VERSION)
 
@@ -221,157 +193,90 @@ def analyze_audio(file_path: str) -> dict:
 # ---------------------------
 # OpenAI naming
 # ---------------------------
-def fallback_name(bpm: int, mood: str, energy: str) -> dict:
-    """
-    Randomized fallback naming (used when OpenAI is unavailable or fails).
-    Keeps results DJ-ready and avoids including BPM in the title.
-    """
-    import random
+def fallback_name(bpm: int, file_bytes: bytes) -> dict:
+    base = make_texture_bpm_title(bpm, file_bytes)
+    slug = slugify(base)
+    return {"trackName": base, "trackSlug": slug}
 
-    adjs = [
-        "Crisp", "Sleek", "Lush", "Clean", "Tight", "Fluid", "Punchy", "Airy", "Warm", "Icy",
-        "Hush", "Rogue", "Sharp", "Soft", "Electric", "Analog", "Chrome", "Satin", "Obsidian", "Cobalt",
-        "Amber", "Prism", "Quartz", "Velour", "Ghosted", "Static", "Feral", "Vivid", "Noir", "Kinetic",
-    ]
-    nouns = [
-        "Crossfade", "Backspin", "Slipstream", "Overdrive", "Afterglow", "Signal", "Blueprint", "Relay",
-        "Waypoint", "Orbit", "Horizon", "Mirage", "Cutscene", "Undertow", "Headroom", "Tension",
-        "Friction", "Catalyst", "Second Wind", "Skylines", "Voltage", "Drift", "Surge", "Glide",
-    ]
-
-    mood_t = sanitize_title(str(mood).strip()) or "Balanced"
-    energy_t = sanitize_title(str(energy).strip()) or "Medium"
-    adj = random.choice(adjs)
-    noun = random.choice(nouns)
-
-    templates = [
-        f"{mood_t} {adj} {noun}",
-        f"{adj} {noun} {energy_t}",
-        f"{mood_t} {noun}",
-        f"{adj} {mood_t} {noun}",
-    ]
-
-    track_name = sanitize_title(random.choice(templates)).strip()
-    # Enforce 2–5 words
-    words = track_name.split()
-    if len(words) < 2:
-        words = [adj, noun]
-    track_name = " ".join(words[:5])
-
-    track_slug = slugify(track_name)
-    return {"trackName": track_name, "trackSlug": track_slug}
-
-
-def generate_name(bpm: int, mood: str, energy: str) -> dict:
+def generate_name(bpm: int, mood: str, energy: str, file_bytes: bytes) -> dict:
     """
     Returns: {"trackName": "...", "trackSlug": "..."}.
-    Uses OpenAI for naming when available; otherwise uses a randomized fallback.
-    Enforces local de-duplication against recently generated slugs.
+    If OpenAI is unavailable or output is invalid, returns fallback.
     """
     import random
-    import json as _json
-
-    # --- Random vocab pools (server-side) ---
-    vibe_pool = [
-        "Crisp", "Sleek", "Silk", "Grit", "Lush", "Clean", "Tight", "Fluid", "Punchy", "Airy",
-        "Warm", "Icy", "Hush", "Rogue", "Sharp", "Soft", "Electric", "Analog", "Chrome", "Satin",
-        "Shadow", "Solar", "Lunar", "Quartz", "Ivory", "Obsidian", "Cobalt", "Amber", "Velour", "Prism",
-        "Motion", "Drift", "Surge", "Glide", "Skate", "Pulse", "Snap", "Sway", "Bloom", "Vortex",
-    ]
-    theme_pool = [
-        "Runway", "Undertow", "Afterglow", "Crossfade", "Backspin", "Switchback", "Slipstream", "Overdrive",
-        "Rooftops", "Sidequest", "Signal", "Blueprint", "Arcade", "Late Train", "Glass City", "Cutscene",
-        "Mirage", "Airstream", "Longform", "Shortcut", "Nightmarket", "Driveway", "Orbit", "Horizon",
-        "Echo", "Relay", "Gravity", "Skylines", "Voltage", "Second Wind", "Headroom", "Tension",
-        "Friction", "Catalyst", "Clutch", "Gears", "Latitude", "Ritual", "Waypoint", "Trim",
-    ]
-
-    # Sample lists (forces divergence per request)
-    vibe_words = random.sample(vibe_pool, k=min(7, len(vibe_pool)))
-    theme_words = random.sample(theme_pool, k=min(7, len(theme_pool)))
-
-    # Build avoid list from recent cache (defined at module level)
-    try:
-        avoid_slugs = list(RECENT_SLUGS)[-25:]
-    except Exception:
-        avoid_slugs = []
-
-    # If OpenAI is missing, randomized fallback (NOT deterministic)
+    
+    # Generate random elements for variety
+    random_seed = random.randint(1000, 9999)
+    vibes = ["midnight", "neon", "velvet", "chrome", "golden", "cosmic", "urban", "desert", "ocean", "thunder", "silk", "crystal", "vapor", "ember", "frost", "solar", "lunar", "electric", "analog", "digital"]
+    themes = ["dreams", "streets", "horizons", "echoes", "shadows", "lights", "waves", "pulses", "drift", "flow", "rush", "calm", "storm", "haze", "glow", "spark", "chill", "heat", "bounce", "groove"]
+    random_vibe = random.choice(vibes)
+    random_theme = random.choice(themes)
+    
     if not OPENAI_API_KEY:
-        return fallback_name(bpm, mood, energy)
+        return fallback_name(bpm, file_bytes)
 
     try:
         from openai import OpenAI
         client = OpenAI(api_key=OPENAI_API_KEY, timeout=OPENAI_TIMEOUT_SEC)
 
-        # Retry a few times if we collide with recent slugs
-        attempts = max(1, SHIFTUNE_NAME_MAX_ATTEMPTS)
+        system = (
+            "You are Shiftune Studio, a DJ-ready track renaming engine.\n"
+            "Rules:\n"
+            "1) Output MUST be valid JSON only (no markdown, no commentary).\n"
+            "2) trackName: 2–5 words, memorable, not cheesy, no profanity.\n"
+            "3) trackSlug: lowercase, hyphens only, derived from trackName.\n"
+            "4) Avoid generic phrases like 'Balanced Medium 120BPM'.\n"
+            "5) Do not include quotes inside the values.\n"
+            "6) EVERY name must be UNIQUE - use the creative hints provided.\n"
+        )
 
-        for _ in range(attempts):
-            user_prompt = build_user_prompt(
-                bpm=bpm,
-                mood=mood,
-                energy=energy,
-                vibe_words=vibe_words,
-                theme_words=theme_words,
-                avoid_slugs=avoid_slugs,
-            )
+        user = (
+            f"Audio traits:\n"
+            f"- BPM: {bpm}\n"
+            f"- Mood: {mood}\n"
+            f"- Energy: {energy}\n\n"
+            f"Creative direction (use as inspiration):\n"
+            f"- Vibe: {random_vibe}\n"
+            f"- Theme: {random_theme}\n"
+            f"- Seed: {random_seed}\n\n"
+            "Return exactly:\n"
+            "{\"trackName\":\"...\",\"trackSlug\":\"...\"}\n"
+        )
 
-            response = client.chat.completions.create(
-                model=OPENAI_MODEL,
-                response_format={"type": "json_object"},
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": user_prompt},
-                ],
-                max_tokens=140,
-                temperature=1.05,
-                top_p=0.92,
-                presence_penalty=0.6,
-                frequency_penalty=0.4,
-            )
+        response = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            max_tokens=60,
+            temperature=1.0,  # Higher for more variety
+        )
 
-            raw = (response.choices[0].message.content or "").strip()
+        raw = (response.choices[0].message.content or "").strip()
+        data = extract_first_json_object(raw)
 
-            # JSON mode should already be clean JSON, but keep defensive parsing
-            data = None
-            try:
-                data = _json.loads(raw)
-            except Exception:
-                data = extract_first_json_object(raw)
+        if not data or "trackName" not in data:
+            logger.warning("OpenAI returned non-JSON or missing fields. Raw=%r", raw[:300])
+            return fallback_name(bpm, file_bytes)
 
-            if not isinstance(data, dict):
-                continue
+        track_name = sanitize_title(str(data.get("trackName", "")))
+        track_slug = slugify(str(data.get("trackSlug", "")) or track_name)
 
-            track_name = sanitize_title(str(data.get("trackName", "")).strip())
-            # Prefer provided slug, else derive from track_name
-            track_slug = slugify(str(data.get("trackSlug", "")).strip() or track_name)
+        # Basic safety: ensure slug isn't empty, ensure name isn't empty
+        if not track_slug or not track_name:
+            return fallback_name(bpm, file_bytes)
 
-            if not track_name or not track_slug:
-                continue
-
-            # Local de-dup guard
-            if track_slug in RECENT_SLUGS_SET:
-                # Add to avoid list and retry
-                avoid_slugs = (avoid_slugs + [track_slug])[-50:]
-                continue
-
-            # Store in recent cache
-            RECENT_SLUGS.append(track_slug)
-            RECENT_SLUGS_SET.add(track_slug)
-            # Trim cache
-            while len(RECENT_SLUGS) > SHIFTUNE_RECENT_SLUG_CACHE:
-                old = RECENT_SLUGS.popleft()
-                RECENT_SLUGS_SET.discard(old)
-
-            return {"trackName": track_name, "trackSlug": track_slug}
-
-        # If we exhausted attempts, fall back
-        return fallback_name(bpm, mood, energy)
+        return {"trackName": track_name, "trackSlug": track_slug}
 
     except Exception as e:
         logger.warning("OpenAI naming failed; using fallback. Error=%s", e)
-        return fallback_name(bpm, mood, energy)
+        return fallback_name(bpm, file_bytes)
+
+
+# ---------------------------
+# Tagging (MP3 / FLAC)
+# ---------------------------
 def write_id3_tags(file_path: str, track_name: str, bpm: int, mood: str, energy: str) -> bytes:
     from mutagen.mp3 import MP3
     from mutagen.id3 import ID3, TIT2, TPE1, TALB, TBPM, COMM, ID3NoHeaderError
@@ -468,7 +373,8 @@ async def process_audio(request: Request, file: UploadFile = File(...)):
             tmp_path = tmp.name
 
         audio_data = analyze_audio(tmp_path)
-        name_data = generate_name(audio_data["bpm"], audio_data["mood"], audio_data["energy"])
+        mat_title = make_texture_bpm_title(audio_data["bpm"], data)
+        name_data = generate_name(audio_data["bpm"], audio_data["mood"], audio_data["energy"], data)
 
         track_name = name_data["trackName"]
         track_slug = name_data["trackSlug"]
@@ -496,6 +402,7 @@ async def process_audio(request: Request, file: UploadFile = File(...)):
             "bpm": audio_data["bpm"],
             "mood": audio_data["mood"],
             "energy": audio_data["energy"],
+            "mat_title": mat_title,
             "original_filename": file.filename,
             "new_filename": new_filename,
             "file_data": file_base64,
