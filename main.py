@@ -39,7 +39,7 @@ RATE_WINDOW_SEC = int(os.getenv("SHIFTUNE_RATE_WINDOW_SEC", "60"))
 RATE_MAX_REQ = int(os.getenv("SHIFTUNE_RATE_MAX_REQ", "40"))  # per IP per window
 
 # OpenAI
-OPENAI_API_KEY = os.getenv("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", "").strip()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o").strip()
 OPENAI_TIMEOUT_SEC = int(os.getenv("OPENAI_TIMEOUT_SEC", "20"))
 
@@ -202,6 +202,15 @@ def generate_name(bpm: int, mood: str, energy: str) -> dict:
     Returns: {"trackName": "...", "trackSlug": "..."}.
     If OpenAI is unavailable or output is invalid, returns fallback.
     """
+    import random
+    
+    # Generate random elements for variety
+    random_seed = random.randint(1000, 9999)
+    vibes = ["midnight", "neon", "velvet", "chrome", "golden", "cosmic", "urban", "desert", "ocean", "thunder", "silk", "crystal", "vapor", "ember", "frost", "solar", "lunar", "electric", "analog", "digital"]
+    themes = ["dreams", "streets", "horizons", "echoes", "shadows", "lights", "waves", "pulses", "drift", "flow", "rush", "calm", "storm", "haze", "glow", "spark", "chill", "heat", "bounce", "groove"]
+    random_vibe = random.choice(vibes)
+    random_theme = random.choice(themes)
+    
     if not OPENAI_API_KEY:
         return fallback_name(bpm, mood, energy)
 
@@ -217,6 +226,7 @@ def generate_name(bpm: int, mood: str, energy: str) -> dict:
             "3) trackSlug: lowercase, hyphens only, derived from trackName.\n"
             "4) Avoid generic phrases like 'Balanced Medium 120BPM'.\n"
             "5) Do not include quotes inside the values.\n"
+            "6) EVERY name must be UNIQUE - use the creative hints provided.\n"
         )
 
         user = (
@@ -224,11 +234,12 @@ def generate_name(bpm: int, mood: str, energy: str) -> dict:
             f"- BPM: {bpm}\n"
             f"- Mood: {mood}\n"
             f"- Energy: {energy}\n\n"
+            f"Creative direction (use as inspiration):\n"
+            f"- Vibe: {random_vibe}\n"
+            f"- Theme: {random_theme}\n"
+            f"- Seed: {random_seed}\n\n"
             "Return exactly:\n"
-            "{\"trackName\":\"...\",\"trackSlug\":\"...\"}\n\n"
-            "Examples (style only):\n"
-            "{\"trackName\":\"Neon Drift\",\"trackSlug\":\"neon-drift\"}\n"
-            "{\"trackName\":\"Velvet Circuit\",\"trackSlug\":\"velvet-circuit\"}\n"
+            "{\"trackName\":\"...\",\"trackSlug\":\"...\"}\n"
         )
 
         response = client.chat.completions.create(
@@ -238,7 +249,7 @@ def generate_name(bpm: int, mood: str, energy: str) -> dict:
                 {"role": "user", "content": user},
             ],
             max_tokens=60,
-            temperature=0.9,
+            temperature=1.0,  # Higher for more variety
         )
 
         raw = (response.choices[0].message.content or "").strip()
