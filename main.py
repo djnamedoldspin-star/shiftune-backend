@@ -231,15 +231,24 @@ TEXTURE_NOUNS = [
     "Nimbus Shuffle", "Prism Leak", "Quartz Stutter", "Satin Switch",
 ]
 
+# Keep a small rolling memory of recent textures so back-to-back calls
+# are less likely to reuse the same one.
+LAST_TEXTURES = deque(maxlen=8)
+
+
+
 
 
 def make_texture_bpm_title(bpm: int, file_bytes: bytes) -> str:
     """
-    Randomized texture title: "<Texture Noun> <BPM>BPM-XXXX".
+    Randomized texture title: "<Texture Noun> <BPM>BPM".
 
-    Uses pure randomness for the texture selection so that even identical
-    audio files in the same batch get different names. The file_bytes
-    argument is accepted for compatibility but is not used.
+    Texture is chosen randomly from TEXTURE_NOUNS, with a small rolling
+    memory (LAST_TEXTURES) so back-to-back calls are less likely to reuse
+    the same texture. The file_bytes argument is accepted for compatibility
+    but is not used.
+
+    Example output: "Velour Step 120BPM"
     """
     try:
         base_bpm = int(round(bpm))
@@ -249,14 +258,15 @@ def make_texture_bpm_title(bpm: int, file_bytes: bytes) -> str:
         except Exception:
             base_bpm = 0
 
-    # Pick a random texture noun independent of the file contents
-    texture_idx = secrets.randbelow(len(TEXTURE_NOUNS))
-    texture = TEXTURE_NOUNS[texture_idx]
+    # Choose a texture, avoiding the most recently used ones when possible
+    available = [t for t in TEXTURE_NOUNS if t not in LAST_TEXTURES]
+    if not available:
+        available = TEXTURE_NOUNS[:]  # all are allowed if we've used many recently
 
-    # 4-character random suffix for uniqueness (per call)
-    suffix = secrets.token_hex(2).upper()  # e.g. "9F3A"
+    texture = secrets.choice(available)
+    LAST_TEXTURES.append(texture)
 
-    return f"{texture} {base_bpm}BPM-{suffix}"
+    return f"{texture} {base_bpm}BPM"
 
 # ---------------------------
 # Audio analysis
